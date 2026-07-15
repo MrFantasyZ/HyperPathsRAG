@@ -676,6 +676,33 @@ def build_subq_adjacency(subqs: list[SubQuestion]) -> dict[int, set[int]]:
     return adj
 
 
+def compute_qid_chains(subqs: list[SubQuestion]) -> dict[int, int]:
+    """Map each sub-question qid to a chain id.
+
+    A chain is a connected component of the sub-question adjacency graph
+    (two subqs are adjacent iff they share an entity slot key). A question
+    that decomposes into parallel reasoning chains — e.g. the two sides of
+    a comparative question, which share no variables — yields one component
+    per side. Used to give every chain a path quota at top-K selection.
+    """
+    adj = build_subq_adjacency(subqs)
+    chain_of: dict[int, int] = {}
+    cid = 0
+    for sq in subqs:
+        if sq.qid in chain_of:
+            continue
+        chain_of[sq.qid] = cid
+        stack = [sq.qid]
+        while stack:
+            u = stack.pop()
+            for v in adj.get(u, ()):
+                if v not in chain_of:
+                    chain_of[v] = cid
+                    stack.append(v)
+        cid += 1
+    return chain_of
+
+
 def compute_levels(G: nx.MultiGraph) -> dict[str, int]:
     """BFS distance from real-entity nodes (level 0) over the bipartite
     entity↔subq graph. Sub-question nodes inherit (entity-level + 1),
@@ -1771,6 +1798,44 @@ def score_variant_paths(
     return scored
 
 
+def select_top_paths_per_chain(
+    scored: list[tuple[list[int], float, dict]],
+    chain_of_path: list[int],
+    top_k: int = TOP_K_PATHS,
+) -> list[tuple[list[int], float, dict]]:
+    """Pick top-K paths, reserving one slot per parallel chain first.
+
+    `scored` must be sorted by score descending; `chain_of_path[i]` is the
+    chain id of `scored[i]`. Each chain contributes its best-scoring path
+    before any chain contributes a second, so a chain whose paths all score
+    below another chain's is not silently dropped — the failure mode for
+    comparative questions, where the answer needs evidence from both sides.
+    Remaining slots go to the global top scorers. With a single chain this
+    degenerates to plain top-K.
+    """
+    if not scored:
+        return []
+    chosen: set[int] = set()
+    # 1. one reserved slot per chain (scored is score-sorted, so the first
+    #    path seen for a chain is that chain's best). If chains outnumber
+    #    top_k, the chains with the best paths win the slots.
+    seen_chains: set[int] = set()
+    for i, cid in enumerate(chain_of_path):
+        if len(chosen) >= top_k:
+            break
+        if cid in seen_chains:
+            continue
+        seen_chains.add(cid)
+        chosen.add(i)
+    # 2. fill remaining slots by global score
+    for i in range(len(scored)):
+        if len(chosen) >= top_k:
+            break
+        chosen.add(i)
+    # 3. emit in global score order (index order == score order)
+    return [scored[i] for i in sorted(chosen)]
+
+
 def score_paths(state: RetrievalState, qid_paths: list[list[int]],
                 max_level: int,
                 kg: KGIndex | None = None,
@@ -2084,11 +2149,20 @@ def retrieve_one(kg: KGIndex, question: str, debug: bool = False) -> dict:
     G_var = build_variant_graph(variants)
     anchor_qids = {sq.qid for sq in anchor_subqs}
     var_paths = enumerate_variant_paths(G_var, variants_by_id, anchor_qids, len(subqs))
-    scored = score_variant_paths(var_paths, variants_by_id, state, kg, len(subqs))
+    scored_all = score_variant_paths(var_paths, variants_by_id, state, kg, len(subqs))
+
+    # Per-chain quota: every parallel reasoning chain keeps its best path
+    # before the remaining slots go to the global top scorers. A path's chain
+    # is that of its anchor (first) variant.
+    chain_of_qid  = compute_qid_chains(subqs)
+    chain_of_path = [chain_of_qid.get(variants_by_id[p[0]].qid, -1)
+                     for p, _s, _t in scored_all]
+    scored = select_top_paths_per_chain(scored_all, chain_of_path, TOP_K_PATHS)
     logger.info(
         "Variants: %d (%d skeleton qids → %d concrete bindings).  "
-        "Variant paths: %d enumerated, %d scored.",
-        len(variants), len(subqs), len(variants), len(var_paths), len(scored),
+        "Variant paths: %d enumerated, %d scored, %d selected across %d chain(s).",
+        len(variants), len(subqs), len(variants), len(var_paths), len(scored_all),
+        len(scored), len(set(chain_of_qid.values())),
     )
 
     # Step 6 — emit context per variant path (each paragraph = one variant chain)
@@ -2100,7 +2174,7 @@ def retrieve_one(kg: KGIndex, question: str, debug: bool = False) -> dict:
         "triplets":    triplets,
         "ke1_size":    len(ke1),
         "max_level":   max_level,
-        "n_paths":     len(scored),
+        "n_paths":     len(scored_all),
         "fallback":    fallback,
         "context":     context,
         "elapsed":     round(elapsed, 1),

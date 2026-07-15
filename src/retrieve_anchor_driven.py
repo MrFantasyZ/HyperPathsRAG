@@ -76,6 +76,7 @@ from retrieve import (
     composed_retrieve, composed_retrieve_relations,
     compute_bm25_relation_scores,
     select_top_relations_with,
+    compute_qid_chains, select_top_paths_per_chain,
     load_questions,
     # classes
     KGIndex, SubQuestion, EntityInfo, SolutionEntry,
@@ -828,9 +829,20 @@ def retrieve_one(kg: KGIndex, question: str, debug: bool = False) -> dict:
                 "context": "", "elapsed": round(time.time() - t0, 1)}
 
     # Step 5 — lineage paths + scoring
-    paths  = enumerate_lineage_paths(all_variants)
-    scored = score_lineage_paths(paths, all_variants, len(subqs))
-    logger.info("Lineage paths: %d enumerated, %d scored", len(paths), len(scored))
+    paths      = enumerate_lineage_paths(all_variants)
+    scored_all = score_lineage_paths(paths, all_variants, len(subqs))
+
+    # Per-chain quota: every parallel reasoning chain keeps its best path
+    # before the remaining slots go to the global top scorers. A path's chain
+    # is that of its root variant.
+    by_id         = {v.var_id: v for v in all_variants}
+    chain_of_qid  = compute_qid_chains(subqs)
+    chain_of_path = [chain_of_qid.get(by_id[p[0]].qid, -1)
+                     for p, _s, _t in scored_all]
+    scored = select_top_paths_per_chain(scored_all, chain_of_path, TOP_K_PATHS)
+    logger.info("Lineage paths: %d enumerated, %d scored, %d selected across %d chain(s)",
+                len(paths), len(scored_all), len(scored),
+                len(set(chain_of_qid.values())))
 
     # Step 6 — context
     context, fallback = organize_lineage_context(kg, scored)
@@ -841,7 +853,7 @@ def retrieve_one(kg: KGIndex, question: str, debug: bool = False) -> dict:
         "triplets":  triplets,
         "ke1_size":  total_ke1,
         "max_level": max_level,
-        "n_paths":   len(scored),
+        "n_paths":   len(scored_all),
         "fallback":  fallback,
         "context":   context,
         "elapsed":   round(elapsed, 1),
