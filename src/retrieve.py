@@ -679,11 +679,9 @@ def build_subq_adjacency(subqs: list[SubQuestion]) -> dict[int, set[int]]:
 def compute_qid_chains(subqs: list[SubQuestion]) -> dict[int, int]:
     """Map each sub-question qid to a chain id.
 
-    A chain is a connected component of the sub-question adjacency graph
-    (two subqs are adjacent iff they share an entity slot key). A question
-    that decomposes into parallel reasoning chains — e.g. the two sides of
-    a comparative question, which share no variables — yields one component
-    per side. Used to give every chain a path quota at top-K selection.
+    A chain is a connected component of the sub-question adjacency graph;
+    parallel chains (e.g. the two sides of a comparative question) share no
+    entity slots and so land in different components.
     """
     adj = build_subq_adjacency(subqs)
     chain_of: dict[int, int] = {}
@@ -1805,20 +1803,15 @@ def select_top_paths_per_chain(
 ) -> list[tuple[list[int], float, dict]]:
     """Pick top-K paths, reserving one slot per parallel chain first.
 
-    `scored` must be sorted by score descending; `chain_of_path[i]` is the
-    chain id of `scored[i]`. Each chain contributes its best-scoring path
-    before any chain contributes a second, so a chain whose paths all score
-    below another chain's is not silently dropped — the failure mode for
-    comparative questions, where the answer needs evidence from both sides.
-    Remaining slots go to the global top scorers. With a single chain this
-    degenerates to plain top-K.
+    `scored` must be score-sorted descending; `chain_of_path[i]` is the chain
+    id of `scored[i]`. Without the reservation one chain can take every slot
+    and leave a comparative question's other side unretrieved. Degenerates to
+    plain top-K when there is a single chain.
     """
     if not scored:
         return []
     chosen: set[int] = set()
-    # 1. one reserved slot per chain (scored is score-sorted, so the first
-    #    path seen for a chain is that chain's best). If chains outnumber
-    #    top_k, the chains with the best paths win the slots.
+    # 1. reserve each chain's best path (score-sorted, so first seen = best)
     seen_chains: set[int] = set()
     for i, cid in enumerate(chain_of_path):
         if len(chosen) >= top_k:
@@ -1832,7 +1825,7 @@ def select_top_paths_per_chain(
         if len(chosen) >= top_k:
             break
         chosen.add(i)
-    # 3. emit in global score order (index order == score order)
+    # 3. index order == score order
     return [scored[i] for i in sorted(chosen)]
 
 
@@ -2151,9 +2144,7 @@ def retrieve_one(kg: KGIndex, question: str, debug: bool = False) -> dict:
     var_paths = enumerate_variant_paths(G_var, variants_by_id, anchor_qids, len(subqs))
     scored_all = score_variant_paths(var_paths, variants_by_id, state, kg, len(subqs))
 
-    # Per-chain quota: every parallel reasoning chain keeps its best path
-    # before the remaining slots go to the global top scorers. A path's chain
-    # is that of its anchor (first) variant.
+    # A path's chain = that of its anchor (first) variant.
     chain_of_qid  = compute_qid_chains(subqs)
     chain_of_path = [chain_of_qid.get(variants_by_id[p[0]].qid, -1)
                      for p, _s, _t in scored_all]

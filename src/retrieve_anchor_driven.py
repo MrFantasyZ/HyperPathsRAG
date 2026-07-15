@@ -832,9 +832,7 @@ def retrieve_one(kg: KGIndex, question: str, debug: bool = False) -> dict:
     paths      = enumerate_lineage_paths(all_variants)
     scored_all = score_lineage_paths(paths, all_variants, len(subqs))
 
-    # Per-chain quota: every parallel reasoning chain keeps its best path
-    # before the remaining slots go to the global top scorers. A path's chain
-    # is that of its root variant.
+    # A path's chain = that of its root variant.
     by_id         = {v.var_id: v for v in all_variants}
     chain_of_qid  = compute_qid_chains(subqs)
     chain_of_path = [chain_of_qid.get(by_id[p[0]].qid, -1)
